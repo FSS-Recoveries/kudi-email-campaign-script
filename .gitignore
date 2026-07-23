@@ -1,0 +1,9 @@
+.env
+service_account.json
+real_campaign_log.json
+real_campaign_log.json.tmp
+test_campaign_log.json
+test_campaign_log.json.tmp
+campaign_run.log
+__pycache__/
+*.pyc

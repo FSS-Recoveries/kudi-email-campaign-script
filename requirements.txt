@@ -1,0 +1,8 @@
+requests
+google-cloud-bigquery
+google-cloud-firestore
+google-auth
+pandas
+db-dtypes
+pyarrow
+python-dotenv
