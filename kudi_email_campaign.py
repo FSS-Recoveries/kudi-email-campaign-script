@@ -36,7 +36,11 @@ TEST_10_LOG_FILE = str(SCRIPT_DIR / "test_campaign_log.json")
 # Tracks every real-campaign send attempt so a kill + same-day rerun can skip
 # anyone already emailed today, instead of relying on BigQuery's
 # daily_email_campaign_success/failed counters (which may lag behind).
-REAL_CAMPAIGN_LOG_FILE = str(SCRIPT_DIR / "real_campaign_log.json")
+# JSON Lines (one send per line, append-only) rather than one big JSON array
+# -- rewriting the whole array on every single send got slower as it grew
+# (tens of thousands of entries), which both delayed timestamps by over an
+# hour under load and made the file-write lock-collision errors worse.
+REAL_CAMPAIGN_LOG_FILE = str(SCRIPT_DIR / "real_campaign_log.jsonl")
 RUN_LOG_FILE = str(SCRIPT_DIR / "campaign_run.log")
 
 
@@ -78,15 +82,24 @@ def _atomic_write_json(path, data):
 
 
 def load_real_log():
+    # Reads the append-only JSON Lines log. A crash mid-write can only ever
+    # leave the last line truncated (never the whole file zero-filled the
+    # way a full-array rewrite could) -- skip an unparseable line instead of
+    # losing everything before it.
+    sent = []
     try:
-        with open(REAL_CAMPAIGN_LOG_FILE, 'r') as f:
-            return _json.load(f)
-    except:
-        return {"sent": []}
-
-
-def save_real_log(log_data):
-    _atomic_write_json(REAL_CAMPAIGN_LOG_FILE, log_data)
+        with open(REAL_CAMPAIGN_LOG_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    sent.append(_json.loads(line))
+                except _json.JSONDecodeError:
+                    continue
+    except FileNotFoundError:
+        pass
+    return {"sent": sent}
 
 
 def get_real_sent_ids():
@@ -100,28 +113,28 @@ def get_real_sent_ids():
     }
 
 
-# Guards the JSON dedupe logs' read-modify-write cycle -- without this,
-# concurrent workers can both load the same on-disk state, append their own
-# entry in memory, and save, with the second save silently overwriting (and
-# losing) the first worker's entry.
+# Guards the log file's append -- without this, two threads' writes could
+# interleave mid-line and corrupt that line (though never anyone else's).
 _dedupe_lock = threading.Lock()
 
 
 def record_real_send(customer, template_label, status, http_status):
+    entry = {
+        "client_id": customer["client_id"],
+        "name": customer["full_name"],
+        "email": customer["send_to_email"],
+        "institution": customer["institution"],
+        "template": template_label,
+        "status": status,
+        "http_status": http_status,
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "timestamp": datetime.now().isoformat(),
+    }
     with _dedupe_lock:
-        log_data = load_real_log()
-        log_data.setdefault("sent", []).append({
-            "client_id": customer["client_id"],
-            "name": customer["full_name"],
-            "email": customer["send_to_email"],
-            "institution": customer["institution"],
-            "template": template_label,
-            "status": status,
-            "http_status": http_status,
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "timestamp": datetime.now().isoformat(),
-        })
-        save_real_log(log_data)
+        with open(REAL_CAMPAIGN_LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(_json.dumps(entry) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
 
 def load_test_log():
