@@ -400,13 +400,16 @@ def get_real_customers():
     log = load_test_log()
     already_tested = log.get("sent_client_ids", [])
     sent_ever = get_real_sent_ids()
-    excluded_ids = list(set(already_tested) | sent_ever)
+    excluded_ids = set(already_tested) | sent_ever
 
-    # Inlining thousands of ids as string literals in the query text hits
-    # BigQuery's query-planning resource limit ("too many fields accessed or
-    # query is too complex") once the exclusion list gets into the
-    # thousands -- an array bind parameter avoids that entirely.
-    test_exclusion = "AND d.client_id NOT IN UNNEST(@excluded_ids)" if excluded_ids else ""
+    # Excluding at the SQL level (literal IN-list, then an array bind
+    # parameter, then a joined temp table) hit a wall at every stage as the
+    # exclusion list grew past ~85,000: BigQuery's planner rejected both the
+    # literal list and the array parameter as "too complex", and this
+    # service account lacks bigquery.tables.create needed for a temp-table
+    # anti-join. Filtering client-side with a plain Python set sidesteps the
+    # whole problem -- no BigQuery-side limit applies to it, regardless of
+    # how large the exclusion list grows.
     if sent_ever:
         log_line(f"Excluding {len(sent_ever)} client(s) with a prior recorded send (resume safety).")
 
@@ -440,24 +443,23 @@ def get_real_customers():
     )
     AND COALESCE(s.success_this_month, 0) < 2
     AND COALESCE(f.failed_ever, 0) = 0
-    {test_exclusion}
     ORDER BY d.net_balance DESC
     {f"LIMIT {SMOKE_TEST_LIMIT}" if SMOKE_TEST_LIMIT else ""}
     """
 
-    job_config = None
-    if excluded_ids:
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ArrayQueryParameter("excluded_ids", "STRING", excluded_ids)]
-        )
-
     log_line("Fetching real customers from BigQuery...")
-    results = bq.query(query, job_config=job_config).to_dataframe()
-    log_line(f"Found {len(results)} customers to email.")
+    results = bq.query(query).to_dataframe()
+    log_line(f"Found {len(results)} customers before exclusion filter.")
 
     customers = []
     skipped_no_email = 0
+    skipped_excluded = 0
     for _, row in results.iterrows():
+        client_id = str(row["client_id"])
+        if client_id in excluded_ids:
+            skipped_excluded += 1
+            continue  # already sent successfully -- don't resend
+
         email = str(row.get("email", "") or "").strip()
         if not email or "@" not in email:
             skipped_no_email += 1
@@ -482,6 +484,8 @@ def get_real_customers():
         c["chatbot_link"] = get_chatbot_link(c["phone"])
         customers.append(c)
 
+    if skipped_excluded:
+        log_line(f"Skipped {skipped_excluded} row(s) already sent (client-side exclusion).")
     if skipped_no_email:
         log_line(f"Skipped {skipped_no_email} row(s) with missing/invalid email.")
 
