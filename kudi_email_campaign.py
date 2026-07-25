@@ -250,11 +250,12 @@ def get_whatsapp_number(phone):
         1: "09062031008",
         2: "08130331665",
         3: "07079492230",
-        4: "09060207537"
+        4: "09060207537",
+        5: "08141916280"  # Itoro - new 6th agent
     }
     try:
         last_two = int(str(phone)[-2:])
-        return WHATSAPP_NUMBERS[last_two % 5]
+        return WHATSAPP_NUMBERS[last_two % 6]
     except:
         return "07026198201"
 
