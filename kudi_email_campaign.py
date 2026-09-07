@@ -434,13 +434,15 @@ def get_real_customers():
     LEFT JOIN success_counts s ON s.client_id = d.client_id
     LEFT JOIN failed_counts f ON f.client_id = d.client_id
     WHERE d.date = CURRENT_DATE()
-    AND d.net_balance > 0
+    AND (
+  (institution = 'KUDA' AND d.net_balance_concession > 0)
+  OR
+  (institution != 'KUDA' AND d.net_balance > 0)
+)  
     AND d.email IS NOT NULL AND d.email != ''
+    AND d.institution NOT LIKE '%ARCHIVED'
     AND d.institution NOT IN (
-        'LAPO','VICTORY EMPOWERMENT',
-        'RENMONEY ARCHIVED','GROOMING MFB ARCHIVED',
-        'KESSINGTON ARCHIVED','REMEDIAL ARCHIVED',
-        'NUMIDA ARCHIVED','ROSABON ARCHIVED'
+        'LAPO','VICTORY EMPOWERMENT','REMEDIAL HEALTH', 'KESSINGTON', 'NOLT','BAOBAB'
     )
     AND COALESCE(s.success_this_month, 0) < 2
     AND COALESCE(f.failed_ever, 0) = 0
