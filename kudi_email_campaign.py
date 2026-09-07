@@ -435,9 +435,9 @@ def get_real_customers():
     LEFT JOIN failed_counts f ON f.client_id = d.client_id
     WHERE d.date = CURRENT_DATE()
     AND (
-  (institution = 'KUDA' AND d.net_balance_concession > 0)
+  (institution = 'KUDA' AND d.net_balance_concession > 1000)
   OR
-  (institution != 'KUDA' AND d.net_balance > 0)
+  (institution != 'KUDA' AND d.net_balance > 1000)
 )  
     AND d.email IS NOT NULL AND d.email != ''
     AND d.institution NOT LIKE '%ARCHIVED'
