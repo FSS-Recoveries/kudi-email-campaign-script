@@ -429,7 +429,7 @@ def get_real_customers():
     SELECT
         d.client_id, d.first_name, d.surname, d.email, d.phone,
         d.institution, d.net_balance, d.net_balance_concession,
-        d.payment_account, d.max_days_in_arrears_running
+        d.payment_account, d.max_days_in_arrears_running, d.total_discount3,
     FROM fssspark.recovery_methods_data.recovery_dashboard_daily d
     LEFT JOIN success_counts s ON s.client_id = d.client_id
     LEFT JOIN failed_counts f ON f.client_id = d.client_id
@@ -479,6 +479,7 @@ def get_real_customers():
             "net_balance_concession": float(row["net_balance_concession"]),
             "payment_account": str(row["payment_account"]),
             "days_overdue": int(row["max_days_in_arrears_running"]),
+            "total_discount3": float(row["total_discount3"]),
         }
         c["full_name"] = f"{c['first_name']} {c['surname']}".title()
         c["suggested_amount"] = round(c["net_balance"] * 0.25)
@@ -583,7 +584,7 @@ DISCOUNT_THRESHOLD = 1000
 
 
 def build_email(first_name, institution, net_balance, net_balance_concession,
-                payment_account, full_name, phone, is_end_of_month, days_overdue):
+                payment_account, full_name, phone, is_end_of_month, days_overdue, total_discount3):
     first_name = str(first_name).capitalize()
     outstanding_fmt = f"<b>NGN {net_balance:,.2f}</b>"
     suggested_fmt_discount= f"<b>NGN {round(net_balance_concession * 0.50):,.0f}</b>"
@@ -591,7 +592,7 @@ def build_email(first_name, institution, net_balance, net_balance_concession,
     settlement_fmt = f"<b>NGN {net_balance_concession:,.2f}</b>"
     whatsapp = get_whatsapp_number(phone)
     chatbot = get_chatbot_link(phone)
-    has_discount = net_balance_concession > DISCOUNT_THRESHOLD
+    has_discount = total_discount3 > DISCOUNT_THRESHOLD
 
     # Bolded versions for use in the body only -- subject lines don't render
     # HTML, so `institution` (plain) stays in every subject= line below.
@@ -785,6 +786,7 @@ def run():
             phone=customer["phone"],
             is_end_of_month=is_end_of_month,
             days_overdue=customer.get("days_overdue", 0),
+            total_discount3=customer["total_discount3"]
         )
 
         log_line("=" * 60)
