@@ -207,11 +207,7 @@ def get_test_customer_from_bq():
 
 
 def get_emmanuel_customer_from_bq():
-    base_dir = BASE_DIR
-    creds = service_account.Credentials.from_service_account_file(
-        str(base_dir / "service_account.json")
-    )
-    bq = bigquery.Client(project="fssspark", credentials=creds)
+    bq = bigquery.Client(project="fssspark", credentials=credentials)
 
     query = """
     SELECT
@@ -392,11 +388,7 @@ def get_test_customers():
 # REAL CAMPAIGN CUSTOMERS
 # -----------------------------
 def get_real_customers():
-    base_dir = BASE_DIR
-    creds = service_account.Credentials.from_service_account_file(
-        str(base_dir / "service_account.json")
-    )
-    bq = bigquery.Client(project="fssspark", credentials=creds)
+    bq = bigquery.Client(project="fssspark", credentials=credentials)
 
     log = load_test_log()
     already_tested = log.get("sent_client_ids", [])
@@ -500,11 +492,7 @@ def get_real_customers():
 # TEST 10 (PILOT) CUSTOMERS
 # -----------------------------
 def get_test_10_customers():
-    base_dir = BASE_DIR
-    creds = service_account.Credentials.from_service_account_file(
-        str(base_dir / "service_account.json")
-    )
-    bq = bigquery.Client(project="fssspark", credentials=creds)
+    bq = bigquery.Client(project="fssspark", credentials=credentials)
 
     log = load_test_log()
     already_tested = log.get("sent_client_ids", [])
