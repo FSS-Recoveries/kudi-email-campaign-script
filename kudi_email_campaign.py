@@ -323,7 +323,7 @@ def get_account_name(institution, payment_account, full_name):
 TEST_MODE = False     # True = send only to Jane and Emmanuel
                      # False = send to real customers from BigQuery
 FORCE_SEND = True    # True = bypass date window and send on any day
-                     # False = only send on day 7 and day 23
+                     # False = only send on day 10 and day 23
 TEST_10_MODE = False  # True = send to 10 real customers as pilot test
                       # These 10 will be logged and excluded from real campaign
 
@@ -744,12 +744,12 @@ def run():
 
     # Date window check
     day = datetime.now().day
-    is_day_7 = day == 7
+    is_day_10 = day == 10
     is_day_23 = day == 23
     is_end_of_month = is_day_23
 
-    if not FORCE_SEND and not is_day_7 and not is_day_23:
-        log_line(f"Today is day {day} — emails only send on day 7 and day 23.")
+    if not FORCE_SEND and not is_day_10 and not is_day_23:
+        log_line(f"Today is day {day} — emails only send on day 10 and day 23.")
         log_line("Set FORCE_SEND = True to send on any other day.")
         return
 
