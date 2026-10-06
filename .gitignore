@@ -6,5 +6,9 @@ real_campaign_log.jsonl
 test_campaign_log.json
 test_campaign_log.json.tmp
 campaign_run.log
+kuda_real_campaign_log.jsonl
+kuda_campaign_run.log
+numida_real_campaign_log.jsonl
+numida_campaign_run.log
 __pycache__/
 *.pyc

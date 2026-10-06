@@ -434,7 +434,7 @@ def get_real_customers():
     AND d.email IS NOT NULL AND d.email != ''
     AND d.institution NOT LIKE '%ARCHIVED'
     AND d.institution NOT IN (
-        'LAPO','VICTORY EMPOWERMENT','REMEDIAL HEALTH', 'KESSINGTON', 'NOLT','BAOBAB'
+        'LAPO','VICTORY EMPOWERMENT','REMEDIAL HEALTH', 'KESSINGTON', 'NOLT','BAOBAB','KUDA','NUMIDA'
     )
     AND COALESCE(s.success_this_month, 0) < 2
     AND COALESCE(f.failed_ever, 0) = 0
