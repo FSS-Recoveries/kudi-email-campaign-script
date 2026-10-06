@@ -127,7 +127,7 @@ def build_email(first_name, net_balance, net_balance_concession, payment_account
 {payment_account_b}<br>
 Account Name: {account_name_line}</p>"""
 
-    proof_line = f'<p>Once you\'ve paid, please send proof via WhatsApp <b>{whatsapp}</b> or reply to this email. You can also reach our team here: {chatbot}</p>'
+    proof_line = f'<p>Once you\'ve paid, please send proof via WhatsApp <b>{whatsapp}</b> or reply to this email. If you\'ve already made a payment recently, thank you. Please send us the proof so we can update your account. You can also reach our team here: {chatbot}</p>'
     signoff = '<p>Kind regards,<br><b>FSS Recovery Team</b><br>On behalf of <b>Kuda</b></p>'
     footer_style = '<style>.unsubscribe, .unsub, [class*="unsub"], [class*="footer"] a { font-size: 2px !important; color: #cccccc !important; }</style>'
 
@@ -141,9 +141,9 @@ Account Name: {account_name_line}</p>"""
         body = f"""
 {core.FSS_LOGO_HTML}
 <p>Hi {first_name},</p>
-<p>FSS is reaching out on behalf of Kuda about your overdue loan. Your account is <b>{days_overdue} days past due</b>, with an outstanding balance of {outstanding_fmt}.</p>
+<p>FSS is working with Kuda on overdue loan accounts, and we're reaching out about yours. Your account is <b>{days_overdue} days past due</b>, with an outstanding balance of {outstanding_fmt}.</p>
 {discount_sentence}
-<p>If you can't pay it all at once, you can start with {suggested_fmt}. Every payment reduces what you owe.</p>
+<p>If you can't pay it all at once, you can start with {suggested_fmt}. Every payment reduces what you owe. If you'd like to agree a payment plan that works for you, just reply to this email.</p>
 {payment_block}
 {proof_line}
 {signoff}
@@ -201,7 +201,7 @@ Account Name: {account_name_line}</p>"""
 {status_sentence}
 <p>If we do not receive a payment, we will escalate the recovery process.</p>
 {payment_block}
-<p>Once you've paid, please send proof via WhatsApp <b>{whatsapp}</b> or reply to this email before the end of the month. You can also reach our team here: {chatbot}</p>
+<p>Once you've paid, please send proof via WhatsApp <b>{whatsapp}</b> or reply to this email before the end of the month. If you've already made a payment recently, thank you. Please send us the proof so we can update your account. You can also reach our team here: {chatbot}</p>
 {signoff}
 {footer_style}
 """
