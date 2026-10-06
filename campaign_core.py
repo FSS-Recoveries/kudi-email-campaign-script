@@ -38,6 +38,14 @@ KUDI_CAMPAIGN_ENDPOINT = "https://my.kudisms.net/api/campaign"
 
 DISCOUNT_THRESHOLD = 1000
 
+# Dates whose daily_email_campaign_failed counts are known-bad and must be
+# excluded from failed_ever -- e.g. 2026-09-29 was one broken Kuda send
+# (~50,192 failures that day) escalated to Kudi, not real bounces. A
+# customer whose only recorded failures fall on an ignored date is treated
+# as never having failed. Add more dates here as similar incidents are
+# confirmed.
+FAILED_DATES_TO_IGNORE = ["2026-09-29"]
+
 
 def get_credentials():
     if "GOOGLE_CREDENTIALS_JSON" in os.environ:
@@ -187,6 +195,11 @@ def fetch_recovery_rows(institution, extra_select_sql="", extra_where_sql=""):
     """
     bq = get_bq_client()
 
+    ignored_dates_filter = ""
+    if FAILED_DATES_TO_IGNORE:
+        ignored_dates_sql = ", ".join(f"'{d}'" for d in FAILED_DATES_TO_IGNORE)
+        ignored_dates_filter = f"WHERE date NOT IN ({ignored_dates_sql})"
+
     query = f"""
     WITH success_counts AS (
         SELECT client_id, SUM(daily_email_campaign_success) AS success_this_month
@@ -203,6 +216,7 @@ def fetch_recovery_rows(institution, extra_select_sql="", extra_where_sql=""):
     failed_counts AS (
         SELECT client_id, SUM(daily_email_campaign_failed) AS failed_ever
         FROM fssspark.recovery_methods_data.recovery_dashboard_daily
+        {ignored_dates_filter}
         GROUP BY client_id
     )
     SELECT
