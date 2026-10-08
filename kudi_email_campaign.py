@@ -318,7 +318,7 @@ def get_account_name(institution, payment_account, full_name):
 
 TEST_MODE = False     # True = send only to Jane and Emmanuel
                      # False = send to real customers from BigQuery
-FORCE_SEND = True    # True = bypass date window and send on any day
+FORCE_SEND = False   # True = bypass date window and send on any day
                      # False = only send on day 10 and day 23
 TEST_10_MODE = False  # True = send to 10 real customers as pilot test
                       # These 10 will be logged and excluded from real campaign
@@ -564,7 +564,10 @@ def get_test_10_customers():
 # -----------------------------
 # EMAIL TEMPLATES
 # -----------------------------
-# Institutions excluded from the real campaign: LAPO, GROOMING MFI, VICTORY EMPOWERMENT
+# Institutions excluded from the real campaign (see the `institution NOT IN (...)`
+# and `NOT LIKE '%ARCHIVED'` clauses in get_real_customers()): LAPO, VICTORY
+# EMPOWERMENT, REMEDIAL HEALTH, KESSINGTON, NOLT, BAOBAB, and any institution
+# whose name ends in "ARCHIVED". Note: GROOMING MFI is NOT excluded.
 # Filter applied in real campaign: email IS NOT NULL AND email != '' (plus a
 # Python-side "@" check in get_real_customers() as a second safety net)
 DISCOUNT_INSTITUTIONS = ['KUDA', 'RENMONEY', 'CREDIT DIRECT']
