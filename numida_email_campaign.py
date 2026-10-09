@@ -105,8 +105,21 @@ def get_credentials():
 credentials = get_credentials()
 
 
+_bq_client = None
+
+
 def get_bq_client():
-    return bigquery.Client(project="fssspark", credentials=credentials)
+    # Reused across every call rather than constructing a fresh
+    # bigquery.Client() each time -- record_send() calls this once per
+    # customer send, and each client carries its own HTTP connection
+    # pool/auth session, so recreating one per send under concurrent
+    # worker threads caused real object churn that contributed to an Out
+    # of Memory crash partway through a run (same issue found in
+    # kuda_email_campaign.py's larger batch).
+    global _bq_client
+    if _bq_client is None:
+        _bq_client = bigquery.Client(project="fssspark", credentials=credentials)
+    return _bq_client
 
 
 # -----------------------------
@@ -160,7 +173,7 @@ def record_send(customer, template_label, status, http_status):
 def summarize_bq_sends():
     """Group this campaign's BigQuery send log by client_id ->
     {count_this_month, last_sent_date}, counting only status == 'sent' rows.
-    Used as the same-day/same-run safety net on top of recovery_dashboard_daily's
+    Used as the same-day/same-run safety net on top of recovery_dashboard_daily_table's
     success counters, which can lag behind real sends (see fetch_recovery_rows
     docstring)."""
     query = f"""
@@ -187,7 +200,7 @@ def summarize_bq_sends():
 # -----------------------------
 def normalize_phone(phone):
     """Canonicalize a phone number for cross-table matching -- both
-    recovery_dashboard_daily and manual_do_not_contact mix 11-digit Nigerian
+    recovery_dashboard_daily_table and manual_do_not_contact mix 11-digit Nigerian
     local numbers (leading 0), 10-digit Kenyan local numbers, and some with
     a 234/254 country code instead of the leading 0."""
     s = re.sub(r"\D", "", str(phone or ""))
@@ -240,7 +253,7 @@ def effective_month_count(bq_count, local_count):
 # BIGQUERY CUSTOMER PULL
 # -----------------------------
 def fetch_recovery_rows(institution, extra_select_sql="", extra_where_sql=""):
-    """Pull today's rows for one institution from recovery_dashboard_daily,
+    """Pull today's rows for one institution from recovery_dashboard_daily_table,
     joined with this-month success counts, all-time last-success date, and
     all-time failed count (excluding FAILED_DATES_TO_IGNORE).
     """
@@ -254,19 +267,19 @@ def fetch_recovery_rows(institution, extra_select_sql="", extra_where_sql=""):
     query = f"""
     WITH success_counts AS (
         SELECT client_id, SUM(daily_email_campaign_success) AS success_this_month
-        FROM fssspark.recovery_methods_data.recovery_dashboard_daily
+        FROM fssspark.recovery_methods_data.recovery_dashboard_daily_table
         WHERE FORMAT_DATE('%Y-%m', date) = FORMAT_DATE('%Y-%m', CURRENT_DATE())
         GROUP BY client_id
     ),
     last_success AS (
         SELECT client_id, MAX(date) AS last_success_date
-        FROM fssspark.recovery_methods_data.recovery_dashboard_daily
+        FROM fssspark.recovery_methods_data.recovery_dashboard_daily_table
         WHERE daily_email_campaign_success > 0
         GROUP BY client_id
     ),
     failed_counts AS (
         SELECT client_id, SUM(daily_email_campaign_failed) AS failed_ever
-        FROM fssspark.recovery_methods_data.recovery_dashboard_daily
+        FROM fssspark.recovery_methods_data.recovery_dashboard_daily_table
         {ignored_dates_filter}
         GROUP BY client_id
     )
@@ -278,7 +291,7 @@ def fetch_recovery_rows(institution, extra_select_sql="", extra_where_sql=""):
         COALESCE(s.success_this_month, 0) AS bq_success_this_month,
         ls.last_success_date AS bq_last_success_date,
         COALESCE(f.failed_ever, 0) AS failed_ever
-    FROM fssspark.recovery_methods_data.recovery_dashboard_daily d
+    FROM fssspark.recovery_methods_data.recovery_dashboard_daily_table d
     LEFT JOIN success_counts s ON s.client_id = d.client_id
     LEFT JOIN last_success ls ON ls.client_id = d.client_id
     LEFT JOIN failed_counts f ON f.client_id = d.client_id

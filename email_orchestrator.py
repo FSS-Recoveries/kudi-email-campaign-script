@@ -32,6 +32,7 @@ import platform
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -221,6 +222,23 @@ def _to_cmd_and_shell(cmd: Union[str, List[str]], shell_flag: Optional[bool]) ->
         # POSIX: split into argv
         return shlex.split(cmd), False
 
+def _tail_file(path: str, n: int = 10, max_bytes: int = 65536) -> Optional[str]:
+    """Read up to the last `n` lines of a file without loading the whole
+    file into memory -- seeks backward from the end instead."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            read_size = min(size, max_bytes)
+            f.seek(size - read_size)
+            data = f.read()
+        text = data.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        return "\n".join(lines[-n:]) if lines else None
+    except OSError:
+        return None
+
+
 def run_step(
     name: str,
     cmd: Union[str, List[str]],
@@ -244,29 +262,44 @@ def run_step(
 
     while True:
         attempts += 1
+        # Subprocess stdout/stderr are written straight to disk rather than
+        # captured via subprocess.run(capture_output=True) -- that buffers
+        # the ENTIRE child output as a Python string in this (parent)
+        # process's memory until the child exits. A step that logs a line
+        # or two per customer across tens of thousands of customers can
+        # accumulate tens to low-hundreds of MB this way, growing for as
+        # long as the child keeps running -- a real contributor to an Out
+        # of Memory crash on a 512Mi instance, on top of the child's own
+        # memory. Writing to files keeps this process's own footprint flat
+        # regardless of how much the child logs; only a small tail is read
+        # back afterward for the report.
+        stdout_path = stderr_path = None
         try:
+            with tempfile.NamedTemporaryFile(prefix="step_stdout_", suffix=".log", delete=False) as f:
+                stdout_path = f.name
+            with tempfile.NamedTemporaryFile(prefix="step_stderr_", suffix=".log", delete=False) as f:
+                stderr_path = f.name
+
             logger.info("Starting: %s", normalized_cmd if isinstance(normalized_cmd, list) else normalized_cmd)
-            completed = subprocess.run(
-                normalized_cmd,
-                cwd=cwd_str,
-                shell=use_shell,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
+            with open(stdout_path, "w") as out_f, open(stderr_path, "w") as err_f:
+                completed = subprocess.run(
+                    normalized_cmd,
+                    cwd=cwd_str,
+                    shell=use_shell,
+                    stdout=out_f,
+                    stderr=err_f,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
             rc = completed.returncode
 
-            # Log outputs
-            if completed.stdout:
-                for line in completed.stdout.splitlines():
-                    logger.info("[stdout] %s", line)
-                stdout_tail = "\n".join(completed.stdout.splitlines()[-10:])  # last 10 lines
-
-            if completed.stderr:
-                for line in completed.stderr.splitlines():
-                    logger.error("[stderr] %s", line)
-                stderr_tail = "\n".join(completed.stderr.splitlines()[-10:])
+            stdout_tail = _tail_file(stdout_path, n=10)
+            stderr_tail = _tail_file(stderr_path, n=10)
+            if stdout_tail:
+                logger.info("[stdout tail]\n%s", stdout_tail)
+            if stderr_tail:
+                logger.error("[stderr tail]\n%s", stderr_tail)
 
             if rc == 0:
                 break  # success
@@ -281,6 +314,13 @@ def run_step(
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
             logger.exception("Exception during run (attempt %d).", attempts)
+        finally:
+            for p in (stdout_path, stderr_path):
+                if p:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
 
         if attempts > retries:
             break

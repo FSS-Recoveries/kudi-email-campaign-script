@@ -104,13 +104,25 @@ def _atomic_write_json(path, data):
     raise last_err
 
 
+_bq_client = None
+
+
 def get_bq_client():
-    return bigquery.Client(project="fssspark", credentials=credentials)
+    # Reused across every call rather than constructing a fresh
+    # bigquery.Client() each time -- record_real_send() calls this once per
+    # customer send, and each client carries its own HTTP connection
+    # pool/auth session, so recreating one per send under concurrent
+    # worker threads caused real object churn that contributed to an Out
+    # of Memory crash partway through a run (found in kuda_email_campaign.py).
+    global _bq_client
+    if _bq_client is None:
+        _bq_client = bigquery.Client(project="fssspark", credentials=credentials)
+    return _bq_client
 
 
 def get_real_sent_ids():
     # Excludes anyone with ANY recorded successful send, not just today's --
-    # BigQuery's success_this_month counter (on recovery_dashboard_daily) can
+    # BigQuery's success_this_month counter (on recovery_dashboard_daily_table) can
     # lag behind actual sends (e.g. after a crash/restart), so it can't be
     # trusted alone to block a repeat. This queries our own send-log table,
     # which is written immediately by record_real_send() below.
@@ -153,7 +165,7 @@ def record_real_send(customer, template_label, status, http_status):
 # -----------------------------
 def normalize_phone(phone):
     """Canonicalize a phone number for cross-table matching -- both
-    recovery_dashboard_daily and manual_do_not_contact mix 11-digit Nigerian
+    recovery_dashboard_daily_table and manual_do_not_contact mix 11-digit Nigerian
     local numbers (leading 0), 10-digit Kenyan local numbers, and some with
     a 234/254 country code instead of the leading 0."""
     s = re.sub(r"\D", "", str(phone or ""))
@@ -220,7 +232,7 @@ def get_test_customer_from_bq():
         client_id, first_name, surname, email, phone,
         institution, net_balance, net_balance_concession,
         payment_account, max_days_in_arrears_running
-    FROM fssspark.recovery_methods_data.recovery_dashboard_daily
+    FROM fssspark.recovery_methods_data.recovery_dashboard_daily_table
     WHERE date = CURRENT_DATE()
     AND first_name = 'jane'
     AND surname = 'ajodo'
@@ -256,7 +268,7 @@ def get_emmanuel_customer_from_bq():
         client_id, first_name, surname, email, phone,
         institution, net_balance, net_balance_concession,
         payment_account, max_days_in_arrears_running
-    FROM fssspark.recovery_methods_data.recovery_dashboard_daily
+    FROM fssspark.recovery_methods_data.recovery_dashboard_daily_table
     WHERE date = CURRENT_DATE()
     AND client_id = 'IDS0001'
     LIMIT 1
@@ -452,13 +464,13 @@ def get_real_customers():
     query = f"""
     WITH success_counts AS (
         SELECT client_id, SUM(daily_email_campaign_success) AS success_this_month
-        FROM fssspark.recovery_methods_data.recovery_dashboard_daily
+        FROM fssspark.recovery_methods_data.recovery_dashboard_daily_table
         WHERE FORMAT_DATE('%Y-%m', date) = FORMAT_DATE('%Y-%m', CURRENT_DATE())
         GROUP BY client_id
     ),
     failed_counts AS (
         SELECT client_id, SUM(daily_email_campaign_failed) AS failed_ever
-        FROM fssspark.recovery_methods_data.recovery_dashboard_daily
+        FROM fssspark.recovery_methods_data.recovery_dashboard_daily_table
         GROUP BY client_id
     )
     SELECT
@@ -466,7 +478,7 @@ def get_real_customers():
         d.institution, d.net_balance, d.net_balance_concession,
         d.payment_account, d.max_days_in_arrears_running, d.total_discount3,
         d.assigned_agent_number,
-    FROM fssspark.recovery_methods_data.recovery_dashboard_daily d
+    FROM fssspark.recovery_methods_data.recovery_dashboard_daily_table d
     LEFT JOIN success_counts s ON s.client_id = d.client_id
     LEFT JOIN failed_counts f ON f.client_id = d.client_id
     WHERE d.date = CURRENT_DATE()
@@ -558,7 +570,7 @@ def get_test_10_customers():
     query = f"""
     WITH success_counts AS (
         SELECT client_id, SUM(daily_email_campaign_success) AS success_this_month
-        FROM fssspark.recovery_methods_data.recovery_dashboard_daily
+        FROM fssspark.recovery_methods_data.recovery_dashboard_daily_table
         WHERE FORMAT_DATE('%Y-%m', date) = FORMAT_DATE('%Y-%m', CURRENT_DATE())
         GROUP BY client_id
     )
@@ -566,7 +578,7 @@ def get_test_10_customers():
         d.client_id, d.first_name, d.surname, d.email, d.phone,
         d.institution, d.net_balance, d.net_balance_concession,
         d.payment_account, d.max_days_in_arrears_running, d.assigned_agent_number
-    FROM fssspark.recovery_methods_data.recovery_dashboard_daily d
+    FROM fssspark.recovery_methods_data.recovery_dashboard_daily_table d
     LEFT JOIN success_counts s ON s.client_id = d.client_id
     WHERE d.date = CURRENT_DATE()
     AND d.net_balance > 0
