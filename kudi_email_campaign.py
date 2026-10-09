@@ -620,7 +620,10 @@ def get_test_10_customers():
 # -----------------------------
 # EMAIL TEMPLATES
 # -----------------------------
-# Institutions excluded from the real campaign: LAPO, GROOMING MFI, VICTORY EMPOWERMENT
+# Institutions excluded from the real campaign (see the `institution NOT IN (...)`
+# and `NOT LIKE '%ARCHIVED'` clauses in get_real_customers()): LAPO, VICTORY
+# EMPOWERMENT, REMEDIAL HEALTH, KESSINGTON, NOLT, BAOBAB, and any institution
+# whose name ends in "ARCHIVED". Note: GROOMING MFI is NOT excluded.
 # Filter applied in real campaign: email IS NOT NULL AND email != '' (plus a
 # Python-side "@" check in get_real_customers() as a second safety net)
 DISCOUNT_INSTITUTIONS = ['KUDA', 'RENMONEY', 'CREDIT DIRECT']
