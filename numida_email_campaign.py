@@ -643,8 +643,14 @@ def run():
     customers, skip_counts = get_numida_customers()
     logger.log(f"Found {len(customers)} NUMIDA customers with a valid email before guards.")
 
-    for c in customers:
-        subject, message, template_label, has_penalty_waiver, template_number = build_email(
+    eligible = [c for c in customers if c["eligible"]]
+    logger.log("")
+    logger.log(f"Eligible to send: {len(eligible)} / {len(customers)}")
+    for reason, count in skip_counts.items():
+        logger.log(f"  Skipped ({reason}): {count}")
+
+    def build_for(c):
+        return build_email(
             first_name=c["greeting_name"],
             net_balance=c["net_balance"],
             effective_balance=c["effective_balance"],
@@ -654,19 +660,17 @@ def run():
             days_overdue=c["days_overdue"],
             assigned_agent_number=c["assigned_agent_number"],
         )
-        c["subject"] = subject
-        c["_message"] = message
-        c["template_label"] = template_label
-        c["has_penalty_waiver"] = has_penalty_waiver
-        c["template_number"] = template_number
 
-    eligible = [c for c in customers if c["eligible"]]
-    logger.log("")
-    logger.log(f"Eligible to send: {len(eligible)} / {len(customers)}")
-    for reason, count in skip_counts.items():
-        logger.log(f"  Skipped ({reason}): {count}")
+    # Build each eligible customer's email once here just for the
+    # template/variant breakdown, discarding the HTML body immediately --
+    # holding every built body in memory at once (instead of building
+    # lazily per send below) is what caused a prior Out of Memory crash on
+    # a 512Mi Render instance (in kuda_email_campaign.py's larger batch).
+    template_variant_counts = Counter()
+    for c in eligible:
+        _, _, template_label, has_penalty_waiver, _ = build_for(c)
+        template_variant_counts[(template_label, has_penalty_waiver)] += 1
 
-    template_variant_counts = Counter((c["template_label"], c["has_penalty_waiver"]) for c in eligible)
     logger.log("")
     logger.log("Template/variant breakdown (eligible only):")
     for (label, has_penalty), count in sorted(template_variant_counts.items()):
@@ -684,21 +688,24 @@ def run():
     logger.log(f"Sending to {len(eligible)} customers with {MAX_WORKERS} concurrent workers.")
 
     def send_to_customer(c):
+        # Built fresh here rather than reused from a pre-built, stored
+        # body -- keeps at most MAX_WORKERS bodies in memory at once.
+        subject, message, template_label, has_penalty_waiver, template_number = build_for(c)
         logger.log("=" * 60)
         logger.log(f"Customer: {c['full_name'] or c['greeting_name']} ({c['client_id']})")
-        logger.log(f"Template: {c['template_label']}")
-        logger.log(f"Subject: {c['subject']}")
+        logger.log(f"Template: {template_label}")
+        logger.log(f"Subject: {subject}")
         logger.log(f"Sending to: {c['send_to_email']}")
         try:
             response, actually_sent, _ = send_email(
-                c["send_to_email"], c["subject"], c["_message"], logger, campaign_name="FSS Numida Campaign"
+                c["send_to_email"], subject, message, logger, campaign_name="FSS Numida Campaign"
             )
             status = "sent" if actually_sent else "failed"
-            record_send(c, c["template_label"], status, response.status_code)
+            record_send(c, template_label, status, response.status_code)
             return actually_sent
         except Exception as e:
             logger.log(f"  ERROR sending to {c['send_to_email']}: {e}")
-            record_send(c, c["template_label"], "error", None)
+            record_send(c, template_label, "error", None)
             return False
 
     sent = 0
