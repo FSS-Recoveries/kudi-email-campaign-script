@@ -38,15 +38,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from google.cloud import bigquery
-from google.oauth2 import service_account
-
 from utils.email_utils import send_email_report
 
 EMAIL_LOG_TABLE = "fssspark.recovery_methods_data.email_campaign_log"
 
 
 def _get_bq_credentials():
+    # google.cloud.bigquery / google.oauth2 are imported lazily, inside this
+    # function rather than at module level -- this file runs as the parent
+    # process for subprocess.run([...,"kuda_email_campaign.py"]) etc, and
+    # each of those is a SEPARATE process that independently loads its own
+    # full copy of bigquery/grpc/protobuf. Importing the same ~130MB stack
+    # here too, at module load time, means it sits in memory for the
+    # orchestrator's entire lifetime, alongside each subprocess's own copy,
+    # all counted against the same container memory limit -- this combo is
+    # what caused a real OOM on a 512Mi Render instance. Deferring the
+    # import to only when the end-of-run CSV is actually built means the
+    # orchestrator stays lightweight while each subprocess (which already
+    # needs this stack regardless) is running.
+    from google.oauth2 import service_account
+
     if "GOOGLE_CREDENTIALS_JSON" in os.environ:
         info = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
         return service_account.Credentials.from_service_account_info(info)
@@ -71,6 +82,8 @@ def fetch_today_send_log_csv() -> Optional[tuple[str, bytes]]:
     completion email, or None if there's nothing to report or the query
     itself fails -- a BigQuery hiccup here should never block the
     completion email from going out."""
+    from google.cloud import bigquery
+
     logger = logging.getLogger("orchestrator")
     try:
         creds = _get_bq_credentials()

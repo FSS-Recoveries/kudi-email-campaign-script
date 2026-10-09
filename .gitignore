@@ -10,5 +10,7 @@ kuda_real_campaign_log.jsonl
 kuda_campaign_run.log
 numida_real_campaign_log.jsonl
 numida_campaign_run.log
+logs/
+summaries/
 __pycache__/
 *.pyc
