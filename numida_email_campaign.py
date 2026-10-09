@@ -16,6 +16,7 @@ Bugs fixed relative to the one-off:
 import sys
 import os
 import json
+import re
 import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -39,6 +40,28 @@ def _require_env(name):
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name} (set it in .env locally, or in Render's dashboard)")
     return value
+
+
+def safe_int(value, default=0):
+    # BigQuery NULLs come back as NaN once a column round-trips through a
+    # DataFrame -- int(nan) raises ValueError and, uncaught in a per-row
+    # loop, would abort the whole campaign over a single bad row.
+    if value is None or value != value:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_str(value, default=""):
+    # Same NaN/None hazard as safe_int, for string fields pulled from a
+    # BigQuery DataFrame (e.g. a numeric agent-number column with NULLs) --
+    # without this, str(nan) silently becomes the literal text "nan".
+    if value is None or (isinstance(value, float) and value != value):
+        return default
+    s = str(value).strip()
+    return s if s and s.lower() not in ("none", "nan") else default
 
 
 KUDI_API_KEY = _require_env("KUDI_API_KEY")
@@ -87,7 +110,7 @@ def get_bq_client():
 
 
 # -----------------------------
-# LOGGING (run log + append-only JSONL send log)
+# LOGGING (run log + BigQuery send log)
 # -----------------------------
 class CampaignLogger:
     def __init__(self, log_path):
@@ -102,42 +125,22 @@ class CampaignLogger:
 
 
 RUN_LOG_FILE = str(SCRIPT_DIR / "numida_campaign_run.log")
-REAL_CAMPAIGN_LOG_FILE = str(SCRIPT_DIR / "numida_real_campaign_log.jsonl")
 
 logger = CampaignLogger(RUN_LOG_FILE)
 
-_dedupe_lock = threading.Lock()
+# Every send attempt is recorded in one shared BigQuery table across
+# kudi/kuda/numida (distinguished by the `campaign` column) rather than a
+# local JSONL file -- Render Cron Jobs give each run a fresh, ephemeral
+# filesystem, so a local dedupe log written in one run would not exist on
+# the next, silently disabling the anti-duplicate-send safety net.
+EMAIL_LOG_TABLE = "fssspark.recovery_methods_data.email_campaign_log"
+CAMPAIGN_NAME = "numida"
 
 
-def load_jsonl(path):
-    """Read an append-only JSON Lines log. Skips an unparseable trailing line
-    (the only thing a crash mid-write can corrupt) instead of losing the rest."""
-    entries = []
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entries.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    except FileNotFoundError:
-        pass
-    return entries
-
-
-def append_jsonl(path, entry):
-    with _dedupe_lock:
-        with open(path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(entry) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-
-
-def record_send(path, customer, template_label, status, http_status):
+def record_send(customer, template_label, status, http_status):
+    now = datetime.now()
     entry = {
+        "campaign": CAMPAIGN_NAME,
         "client_id": customer["client_id"],
         "name": customer["full_name"],
         "email": customer["send_to_email"],
@@ -145,33 +148,69 @@ def record_send(path, customer, template_label, status, http_status):
         "template": template_label,
         "status": status,
         "http_status": http_status,
-        "date": datetime.now().strftime("%Y-%m-%d"),
-        "timestamp": datetime.now().isoformat(),
+        "send_date": now.strftime("%Y-%m-%d"),
+        "sent_at": now.isoformat(),
     }
-    append_jsonl(path, entry)
+    errors = get_bq_client().insert_rows_json(EMAIL_LOG_TABLE, [entry])
+    if errors:
+        logger.log(f"  WARNING: failed to write send-log row to BigQuery: {errors}")
     return entry
 
 
-def summarize_local_sends(path):
-    """Group a JSONL send log by client_id -> {count_this_month, last_sent_date}
-    counting only status == 'sent' entries. Used as the same-day/same-run
-    safety net on top of BigQuery's success counters, which can lag behind
-    real sends (see fetch_recovery_rows docstring)."""
-    current_month = datetime.now().strftime("%Y-%m")
-    summary = {}
-    for e in load_jsonl(path):
-        if e.get("status") != "sent":
-            continue
-        cid = e.get("client_id")
-        date = e.get("date", "")
-        if not cid or not date:
-            continue
-        s = summary.setdefault(cid, {"count_this_month": 0, "last_sent_date": None})
-        if date.startswith(current_month):
-            s["count_this_month"] += 1
-        if s["last_sent_date"] is None or date > s["last_sent_date"]:
-            s["last_sent_date"] = date
-    return summary
+def summarize_bq_sends():
+    """Group this campaign's BigQuery send log by client_id ->
+    {count_this_month, last_sent_date}, counting only status == 'sent' rows.
+    Used as the same-day/same-run safety net on top of recovery_dashboard_daily's
+    success counters, which can lag behind real sends (see fetch_recovery_rows
+    docstring)."""
+    query = f"""
+    SELECT
+        client_id,
+        COUNTIF(FORMAT_DATE('%Y-%m', send_date) = FORMAT_DATE('%Y-%m', CURRENT_DATE())) AS count_this_month,
+        MAX(send_date) AS last_sent_date
+    FROM `{EMAIL_LOG_TABLE}`
+    WHERE campaign = '{CAMPAIGN_NAME}' AND status = 'sent'
+    GROUP BY client_id
+    """
+    rows = get_bq_client().query(query).result()
+    return {
+        r["client_id"]: {
+            "count_this_month": int(r["count_this_month"] or 0),
+            "last_sent_date": r["last_sent_date"].isoformat() if r["last_sent_date"] else None,
+        }
+        for r in rows
+    }
+
+
+# -----------------------------
+# DO-NOT-CONTACT SUPPRESSION
+# -----------------------------
+def normalize_phone(phone):
+    """Canonicalize a phone number for cross-table matching -- both
+    recovery_dashboard_daily and manual_do_not_contact mix 11-digit Nigerian
+    local numbers (leading 0), 10-digit Kenyan local numbers, and some with
+    a 234/254 country code instead of the leading 0."""
+    s = re.sub(r"\D", "", str(phone or ""))
+    if s.startswith("234") and len(s) > 10:
+        s = "0" + s[3:]
+    elif s.startswith("254") and len(s) > 9:
+        s = "0" + s[3:]
+    if s and not s.startswith("0") and len(s) in (9, 10):
+        s = "0" + s
+    return s
+
+
+def get_do_not_contact_phones():
+    """Normalized phone numbers to suppress from every campaign, regardless
+    of which institution the manual_do_not_contact row names. Active is
+    treated as blocking unless explicitly False."""
+    query = """
+    SELECT phone
+    FROM `fssspark.original_cohorts.manual_do_not_contact`
+    WHERE COALESCE(Active, TRUE) != FALSE
+    """
+    rows = get_bq_client().query(query).result()
+    return {normalize_phone(r["phone"]) for r in rows if r["phone"]}
 
 
 def days_since(date_str):
@@ -267,8 +306,12 @@ def build_full_name(first_name, surname):
 
 
 def get_chatbot_link(phone):
+    # Numida is Kenya-only (see module docstring) -- strip the 254 country
+    # code rather than Nigeria's 234, which the original Kuda/Kudi script
+    # uses. A Kenyan number like 254712345678 would otherwise fall through
+    # to the "else" branch and come out as 0254712345678.
     phone_str = str(phone).strip()
-    if phone_str.startswith('234'):
+    if phone_str.startswith('254'):
         local = '0' + phone_str[3:]
     elif phone_str.startswith('0'):
         local = phone_str
@@ -380,15 +423,23 @@ def send_email(recipient, subject, message, logger, campaign_name="FSS Email Cam
 # -----------------------------
 # CONFIG (script-specific)
 # -----------------------------
-DRY_RUN = True  # True = build/report every email without calling the send API
-                # or writing to the dedupe log. Set False only after a
-                # reviewed dry run.
+DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
+# True = build/report every email without calling the send API or writing
+# to the dedupe log. Defaults to True (safe) unless DRY_RUN=false is set
+# via env var -- flip it in Render's dashboard once a dry run has been
+# reviewed; no code change or redeploy needed.
 
 MAX_WORKERS = 5
 
 CURRENCY_LABEL = "KES"
 
-# Frequency guards -- same rationale as kuda_email_campaign.py: BigQuery's
+# Fixed send days -- mirrors kudi_email_campaign.py's day-10/day-23 gate, so
+# this script can be invoked by a daily cron and still only actually act on
+# these two calendar days each month.
+FIXED_SEND_DAYS = {10, 23}
+
+# Per-customer frequency guards -- kept as a second safety net alongside
+# FIXED_SEND_DAYS, same rationale as kuda_email_campaign.py: BigQuery's
 # success counters can lag behind real sends, so both BigQuery's
 # monthly/last-success data AND this script's own local send log are
 # checked, taking whichever signal is more conservative.
@@ -405,6 +456,12 @@ BALANCE_FILTER_THRESHOLD = 100
 # 100 there), reused here as the gate on the penalty AMOUNT (net_balance -
 # effective_balance) rather than on the balance itself.
 PENALTY_THRESHOLD = 100
+
+# Fallback WhatsApp contact when a customer has no assigned_agent_number in
+# BigQuery -- without this, a missing/NULL value (which pandas can surface
+# as NaN, not an empty string) would show up in the email as the literal
+# text "nan" instead of a usable number.
+DEFAULT_ASSIGNED_AGENT = "0797188468"
 
 
 def resolve_greeting_name(first_name, surname):
@@ -426,7 +483,8 @@ def get_numida_customers():
         institution="NUMIDA",
         extra_select_sql="d.net_balance_excl_pen, d.assigned_agent_number",
     )
-    local_summary = summarize_local_sends(REAL_CAMPAIGN_LOG_FILE)
+    local_summary = summarize_bq_sends()
+    dnc_phones = get_do_not_contact_phones()
 
     customers = []
     skip_counts = Counter()
@@ -460,8 +518,8 @@ def get_numida_customers():
             "effective_balance": effective_balance,
             "balance_source": balance_source,
             "payment_account": str(row["payment_account"]),
-            "days_overdue": int(row["max_days_in_arrears_running"]),
-            "assigned_agent_number": str(row.get("assigned_agent_number", "") or ""),
+            "days_overdue": safe_int(row["max_days_in_arrears_running"]),
+            "assigned_agent_number": safe_str(row.get("assigned_agent_number", "")) or DEFAULT_ASSIGNED_AGENT,
         }
         c["full_name"] = build_full_name(first_name_raw, surname_raw)
 
@@ -473,6 +531,8 @@ def get_numida_customers():
 
         if not email or "@" not in email:
             reason = "no_valid_email"
+        elif normalize_phone(c["phone"]) in dnc_phones:
+            reason = "do_not_contact"
         elif failed_ever > 0:
             reason = "failed_ever"
         elif not passes_balance_filter:
@@ -575,6 +635,11 @@ def run():
     logger.log(f"DRY_RUN = {DRY_RUN}")
     logger.log("=" * 70)
 
+    day = datetime.now().day
+    if day not in FIXED_SEND_DAYS:
+        logger.log(f"Today is day {day} — Numida campaign only sends on days {sorted(FIXED_SEND_DAYS)}. Exiting.")
+        return [], Counter(), []
+
     customers, skip_counts = get_numida_customers()
     logger.log(f"Found {len(customers)} NUMIDA customers with a valid email before guards.")
 
@@ -629,11 +694,11 @@ def run():
                 c["send_to_email"], c["subject"], c["_message"], logger, campaign_name="FSS Numida Campaign"
             )
             status = "sent" if actually_sent else "failed"
-            record_send(REAL_CAMPAIGN_LOG_FILE, c, c["template_label"], status, response.status_code)
+            record_send(c, c["template_label"], status, response.status_code)
             return actually_sent
         except Exception as e:
             logger.log(f"  ERROR sending to {c['send_to_email']}: {e}")
-            record_send(REAL_CAMPAIGN_LOG_FILE, c, c["template_label"], "error", None)
+            record_send(c, c["template_label"], "error", None)
             return False
 
     sent = 0

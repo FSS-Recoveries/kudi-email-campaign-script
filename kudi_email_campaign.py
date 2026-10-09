@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import re
 import requests
 import threading
 import time
@@ -23,6 +24,28 @@ def _require_env(name):
         raise RuntimeError(f"Missing required environment variable: {name} (set it in .env locally, or in Render's dashboard)")
     return value
 
+
+def safe_int(value, default=0):
+    # BigQuery NULLs come back as NaN once a column round-trips through a
+    # DataFrame -- int(nan) raises ValueError and, uncaught in a per-row
+    # loop, would abort the whole campaign over a single bad row.
+    if value is None or value != value:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_str(value, default=""):
+    # Same NaN/None hazard as safe_int, for string fields pulled from a
+    # BigQuery DataFrame (e.g. assigned_agent_number with NULLs) -- without
+    # this, str(nan) silently becomes the literal text "nan".
+    if value is None or (isinstance(value, float) and value != value):
+        return default
+    s = str(value).strip()
+    return s if s and s.lower() not in ("none", "nan") else default
+
 KUDI_API_KEY = _require_env("KUDI_API_KEY")
 SENDER_EMAIL = _require_env("SENDER_EMAIL")
 SENDER_NAME = _require_env("SENDER_NAME")
@@ -33,15 +56,15 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 BASE_DIR = SCRIPT_DIR.parent
 
 TEST_10_LOG_FILE = str(SCRIPT_DIR / "test_campaign_log.json")
-# Tracks every real-campaign send attempt so a kill + same-day rerun can skip
-# anyone already emailed today, instead of relying on BigQuery's
-# daily_email_campaign_success/failed counters (which may lag behind).
-# JSON Lines (one send per line, append-only) rather than one big JSON array
-# -- rewriting the whole array on every single send got slower as it grew
-# (tens of thousands of entries), which both delayed timestamps by over an
-# hour under load and made the file-write lock-collision errors worse.
-REAL_CAMPAIGN_LOG_FILE = str(SCRIPT_DIR / "real_campaign_log.jsonl")
 RUN_LOG_FILE = str(SCRIPT_DIR / "campaign_run.log")
+
+# Every send attempt is recorded in one shared BigQuery table across
+# kudi/kuda/numida (distinguished by the `campaign` column) rather than a
+# local JSONL file -- Render Cron Jobs give each run a fresh, ephemeral
+# filesystem, so a local dedupe log written in one run would not exist on
+# the next, silently disabling the anti-duplicate-send safety net.
+EMAIL_LOG_TABLE = "fssspark.recovery_methods_data.email_campaign_log"
+CAMPAIGN_NAME = "kudi"
 
 
 _run_log_lock = threading.Lock()
@@ -81,45 +104,35 @@ def _atomic_write_json(path, data):
     raise last_err
 
 
-def load_real_log():
-    # Reads the append-only JSON Lines log. A crash mid-write can only ever
-    # leave the last line truncated (never the whole file zero-filled the
-    # way a full-array rewrite could) -- skip an unparseable line instead of
-    # losing everything before it.
-    sent = []
-    try:
-        with open(REAL_CAMPAIGN_LOG_FILE, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    sent.append(_json.loads(line))
-                except _json.JSONDecodeError:
-                    continue
-    except FileNotFoundError:
-        pass
-    return {"sent": sent}
+def get_bq_client():
+    return bigquery.Client(project="fssspark", credentials=credentials)
 
 
 def get_real_sent_ids():
     # Excludes anyone with ANY recorded successful send, not just today's --
-    # BigQuery's success_this_month counter can lag behind actual sends (e.g.
-    # after a crash/restart), so it can't be trusted alone to block a repeat.
-    log_data = load_real_log()
-    return {
-        e["client_id"] for e in log_data.get("sent", [])
-        if e.get("status") == "sent"
-    }
+    # BigQuery's success_this_month counter (on recovery_dashboard_daily) can
+    # lag behind actual sends (e.g. after a crash/restart), so it can't be
+    # trusted alone to block a repeat. This queries our own send-log table,
+    # which is written immediately by record_real_send() below.
+    query = f"""
+    SELECT DISTINCT client_id
+    FROM `{EMAIL_LOG_TABLE}`
+    WHERE campaign = '{CAMPAIGN_NAME}' AND status = 'sent'
+    """
+    rows = get_bq_client().query(query).result()
+    return {r["client_id"] for r in rows}
 
 
-# Guards the log file's append -- without this, two threads' writes could
-# interleave mid-line and corrupt that line (though never anyone else's).
+# Guards the BigQuery insert -- without this, two threads' writes could
+# race on building the same request (insert_rows_json itself is safe for
+# concurrent calls, but this keeps behavior identical to before).
 _dedupe_lock = threading.Lock()
 
 
 def record_real_send(customer, template_label, status, http_status):
+    now = datetime.now()
     entry = {
+        "campaign": CAMPAIGN_NAME,
         "client_id": customer["client_id"],
         "name": customer["full_name"],
         "email": customer["send_to_email"],
@@ -127,14 +140,43 @@ def record_real_send(customer, template_label, status, http_status):
         "template": template_label,
         "status": status,
         "http_status": http_status,
-        "date": datetime.now().strftime("%Y-%m-%d"),
-        "timestamp": datetime.now().isoformat(),
+        "send_date": now.strftime("%Y-%m-%d"),
+        "sent_at": now.isoformat(),
     }
-    with _dedupe_lock:
-        with open(REAL_CAMPAIGN_LOG_FILE, 'a', encoding='utf-8') as f:
-            f.write(_json.dumps(entry) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+    errors = get_bq_client().insert_rows_json(EMAIL_LOG_TABLE, [entry])
+    if errors:
+        log_line(f"  WARNING: failed to write send-log row to BigQuery: {errors}")
+
+
+# -----------------------------
+# DO-NOT-CONTACT SUPPRESSION
+# -----------------------------
+def normalize_phone(phone):
+    """Canonicalize a phone number for cross-table matching -- both
+    recovery_dashboard_daily and manual_do_not_contact mix 11-digit Nigerian
+    local numbers (leading 0), 10-digit Kenyan local numbers, and some with
+    a 234/254 country code instead of the leading 0."""
+    s = re.sub(r"\D", "", str(phone or ""))
+    if s.startswith("234") and len(s) > 10:
+        s = "0" + s[3:]
+    elif s.startswith("254") and len(s) > 9:
+        s = "0" + s[3:]
+    if s and not s.startswith("0") and len(s) in (9, 10):
+        s = "0" + s
+    return s
+
+
+def get_do_not_contact_phones():
+    """Normalized phone numbers to suppress from every campaign, regardless
+    of which institution the manual_do_not_contact row names. Active is
+    treated as blocking unless explicitly False."""
+    query = """
+    SELECT phone
+    FROM `fssspark.original_cohorts.manual_do_not_contact`
+    WHERE COALESCE(Active, TRUE) != FALSE
+    """
+    rows = get_bq_client().query(query).result()
+    return {normalize_phone(r["phone"]) for r in rows if r["phone"]}
 
 
 def load_test_log():
@@ -202,7 +244,7 @@ def get_test_customer_from_bq():
         "net_balance": float(row["net_balance"]),
         "net_balance_concession": float(row["net_balance_concession"]),
         "payment_account": str(row["payment_account"]),
-        "days_overdue": int(row["max_days_in_arrears_running"]),
+        "days_overdue": safe_int(row["max_days_in_arrears_running"]),
     }
 
 
@@ -236,7 +278,7 @@ def get_emmanuel_customer_from_bq():
         "net_balance": float(row["net_balance"]),
         "net_balance_concession": float(row["net_balance_concession"]),
         "payment_account": str(row["payment_account"]),
-        "days_overdue": int(row["max_days_in_arrears_running"]),
+        "days_overdue": safe_int(row["max_days_in_arrears_running"]),
     }
 
 
@@ -318,7 +360,7 @@ def get_account_name(institution, payment_account, full_name):
 
 TEST_MODE = False     # True = send only to Jane and Emmanuel
                      # False = send to real customers from BigQuery
-FORCE_SEND = True    # True = bypass date window and send on any day
+FORCE_SEND = False   # True = bypass date window and send on any day
                      # False = only send on day 10 and day 23
 TEST_10_MODE = False  # True = send to 10 real customers as pilot test
                       # These 10 will be logged and excluded from real campaign
@@ -394,6 +436,7 @@ def get_real_customers():
     already_tested = log.get("sent_client_ids", [])
     sent_ever = get_real_sent_ids()
     excluded_ids = set(already_tested) | sent_ever
+    dnc_phones = get_do_not_contact_phones()
 
     # Excluding at the SQL level (literal IN-list, then an array bind
     # parameter, then a joined temp table) hit a wall at every stage as the
@@ -422,6 +465,7 @@ def get_real_customers():
         d.client_id, d.first_name, d.surname, d.email, d.phone,
         d.institution, d.net_balance, d.net_balance_concession,
         d.payment_account, d.max_days_in_arrears_running, d.total_discount3,
+        d.assigned_agent_number,
     FROM fssspark.recovery_methods_data.recovery_dashboard_daily d
     LEFT JOIN success_counts s ON s.client_id = d.client_id
     LEFT JOIN failed_counts f ON f.client_id = d.client_id
@@ -449,6 +493,7 @@ def get_real_customers():
     customers = []
     skipped_no_email = 0
     skipped_excluded = 0
+    skipped_dnc = 0
     for _, row in results.iterrows():
         client_id = str(row["client_id"])
         if client_id in excluded_ids:
@@ -460,6 +505,10 @@ def get_real_customers():
             skipped_no_email += 1
             continue  # skip customers with no valid email
 
+        if normalize_phone(row["phone"]) in dnc_phones:
+            skipped_dnc += 1
+            continue  # on the manual do-not-contact list -- never email
+
         c = {
             "client_id": str(row["client_id"]),
             "first_name": str(row["first_name"]),
@@ -470,8 +519,9 @@ def get_real_customers():
             "net_balance": float(row["net_balance"]),
             "net_balance_concession": float(row["net_balance_concession"]),
             "payment_account": str(row["payment_account"]),
-            "days_overdue": int(row["max_days_in_arrears_running"]),
+            "days_overdue": safe_int(row["max_days_in_arrears_running"]),
             "total_discount3": float(row["total_discount3"]),
+            "assigned_agent_number": safe_str(row.get("assigned_agent_number", "")),
         }
         c["full_name"] = f"{c['first_name']} {c['surname']}".title()
         c["suggested_amount"] = round(c["net_balance"] * 0.25)
@@ -484,6 +534,8 @@ def get_real_customers():
         log_line(f"Skipped {skipped_excluded} row(s) already sent (client-side exclusion).")
     if skipped_no_email:
         log_line(f"Skipped {skipped_no_email} row(s) with missing/invalid email.")
+    if skipped_dnc:
+        log_line(f"Skipped {skipped_dnc} row(s) on the manual do-not-contact list.")
 
     return customers
 
@@ -496,6 +548,7 @@ def get_test_10_customers():
 
     log = load_test_log()
     already_tested = log.get("sent_client_ids", [])
+    dnc_phones = get_do_not_contact_phones()
 
     exclusion_str = ""
     if already_tested:
@@ -512,7 +565,7 @@ def get_test_10_customers():
     SELECT
         d.client_id, d.first_name, d.surname, d.email, d.phone,
         d.institution, d.net_balance, d.net_balance_concession,
-        d.payment_account, d.max_days_in_arrears_running
+        d.payment_account, d.max_days_in_arrears_running, d.assigned_agent_number
     FROM fssspark.recovery_methods_data.recovery_dashboard_daily d
     LEFT JOIN success_counts s ON s.client_id = d.client_id
     WHERE d.date = CURRENT_DATE()
@@ -539,6 +592,8 @@ def get_test_10_customers():
         email = str(row.get("email", "") or "").strip()
         if not email or "@" not in email:
             continue
+        if normalize_phone(row["phone"]) in dnc_phones:
+            continue  # on the manual do-not-contact list -- never email
         c = {
             "client_id": str(row["client_id"]),
             "first_name": str(row["first_name"]),
@@ -549,7 +604,8 @@ def get_test_10_customers():
             "net_balance": float(row["net_balance"]),
             "net_balance_concession": float(row["net_balance_concession"]),
             "payment_account": str(row["payment_account"]),
-            "days_overdue": int(row["max_days_in_arrears_running"]),
+            "days_overdue": safe_int(row["max_days_in_arrears_running"]),
+            "assigned_agent_number": safe_str(row.get("assigned_agent_number", "")),
         }
         c["full_name"] = f"{c['first_name']} {c['surname']}".title()
         c["suggested_amount"] = round(c["net_balance"] * 0.25)
@@ -572,13 +628,17 @@ DISCOUNT_THRESHOLD = 1000
 
 
 def build_email(first_name, institution, net_balance, net_balance_concession,
-                payment_account, full_name, phone, is_end_of_month, days_overdue, total_discount3):
+                payment_account, full_name, phone, is_end_of_month, days_overdue, total_discount3,
+                assigned_agent_number=None):
     first_name = str(first_name).capitalize()
     outstanding_fmt = f"<b>NGN {net_balance:,.2f}</b>"
     suggested_fmt_discount= f"<b>NGN {round(net_balance_concession * 0.50):,.0f}</b>"
     suggested_fmt= f"<b>NGN {round(net_balance * 0.25):,.0f}</b>"
     settlement_fmt = f"<b>NGN {net_balance_concession:,.2f}</b>"
-    whatsapp = get_whatsapp_number(phone)
+    # Prefer the per-customer assigned_agent_number from BigQuery; only fall
+    # back to the generic phone-modulo-6 bucket when it's missing for this
+    # customer.
+    whatsapp = assigned_agent_number or get_whatsapp_number(phone)
     chatbot = get_chatbot_link(phone)
     has_discount = total_discount3 > DISCOUNT_THRESHOLD
 
@@ -774,7 +834,8 @@ def run():
             phone=customer["phone"],
             is_end_of_month=is_end_of_month,
             days_overdue=customer.get("days_overdue", 0),
-            total_discount3=customer["total_discount3"]
+            total_discount3=customer["total_discount3"],
+            assigned_agent_number=customer.get("assigned_agent_number"),
         )
 
         log_line("=" * 60)

@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import re
 import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,6 +25,28 @@ def _require_env(name):
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name} (set it in .env locally, or in Render's dashboard)")
     return value
+
+
+def safe_int(value, default=0):
+    # BigQuery NULLs come back as NaN once a column round-trips through a
+    # DataFrame -- int(nan) raises ValueError and, uncaught in a per-row
+    # loop, would abort the whole campaign over a single bad row.
+    if value is None or value != value:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_str(value, default=""):
+    # Same NaN/None hazard as safe_int, for string fields pulled from a
+    # BigQuery DataFrame (e.g. assigned_agent_number with NULLs) -- without
+    # this, str(nan) silently becomes the literal text "nan".
+    if value is None or (isinstance(value, float) and value != value):
+        return default
+    s = str(value).strip()
+    return s if s and s.lower() not in ("none", "nan") else default
 
 
 KUDI_API_KEY = _require_env("KUDI_API_KEY")
@@ -74,7 +97,7 @@ def get_bq_client():
 
 
 # -----------------------------
-# LOGGING (run log + append-only JSONL send log)
+# LOGGING (run log + BigQuery send log)
 # -----------------------------
 class CampaignLogger:
     def __init__(self, log_path):
@@ -89,42 +112,22 @@ class CampaignLogger:
 
 
 RUN_LOG_FILE = str(SCRIPT_DIR / "kuda_campaign_run.log")
-REAL_CAMPAIGN_LOG_FILE = str(SCRIPT_DIR / "kuda_real_campaign_log.jsonl")
 
 logger = CampaignLogger(RUN_LOG_FILE)
 
-_dedupe_lock = threading.Lock()
+# Every send attempt is recorded in one shared BigQuery table across
+# kudi/kuda/numida (distinguished by the `campaign` column) rather than a
+# local JSONL file -- Render Cron Jobs give each run a fresh, ephemeral
+# filesystem, so a local dedupe log written in one run would not exist on
+# the next, silently disabling the anti-duplicate-send safety net.
+EMAIL_LOG_TABLE = "fssspark.recovery_methods_data.email_campaign_log"
+CAMPAIGN_NAME = "kuda"
 
 
-def load_jsonl(path):
-    """Read an append-only JSON Lines log. Skips an unparseable trailing line
-    (the only thing a crash mid-write can corrupt) instead of losing the rest."""
-    entries = []
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entries.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    except FileNotFoundError:
-        pass
-    return entries
-
-
-def append_jsonl(path, entry):
-    with _dedupe_lock:
-        with open(path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(entry) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-
-
-def record_send(path, customer, template_label, status, http_status):
+def record_send(customer, template_label, status, http_status):
+    now = datetime.now()
     entry = {
+        "campaign": CAMPAIGN_NAME,
         "client_id": customer["client_id"],
         "name": customer["full_name"],
         "email": customer["send_to_email"],
@@ -132,33 +135,69 @@ def record_send(path, customer, template_label, status, http_status):
         "template": template_label,
         "status": status,
         "http_status": http_status,
-        "date": datetime.now().strftime("%Y-%m-%d"),
-        "timestamp": datetime.now().isoformat(),
+        "send_date": now.strftime("%Y-%m-%d"),
+        "sent_at": now.isoformat(),
     }
-    append_jsonl(path, entry)
+    errors = get_bq_client().insert_rows_json(EMAIL_LOG_TABLE, [entry])
+    if errors:
+        logger.log(f"  WARNING: failed to write send-log row to BigQuery: {errors}")
     return entry
 
 
-def summarize_local_sends(path):
-    """Group a JSONL send log by client_id -> {count_this_month, last_sent_date}
-    counting only status == 'sent' entries. Used as the same-day/same-run
-    safety net on top of BigQuery's success counters, which can lag behind
-    real sends (see fetch_recovery_rows docstring)."""
-    current_month = datetime.now().strftime("%Y-%m")
-    summary = {}
-    for e in load_jsonl(path):
-        if e.get("status") != "sent":
-            continue
-        cid = e.get("client_id")
-        date = e.get("date", "")
-        if not cid or not date:
-            continue
-        s = summary.setdefault(cid, {"count_this_month": 0, "last_sent_date": None})
-        if date.startswith(current_month):
-            s["count_this_month"] += 1
-        if s["last_sent_date"] is None or date > s["last_sent_date"]:
-            s["last_sent_date"] = date
-    return summary
+def summarize_bq_sends():
+    """Group this campaign's BigQuery send log by client_id ->
+    {count_this_month, last_sent_date}, counting only status == 'sent' rows.
+    Used as the same-day/same-run safety net on top of recovery_dashboard_daily's
+    success counters, which can lag behind real sends (see fetch_recovery_rows
+    docstring)."""
+    query = f"""
+    SELECT
+        client_id,
+        COUNTIF(FORMAT_DATE('%Y-%m', send_date) = FORMAT_DATE('%Y-%m', CURRENT_DATE())) AS count_this_month,
+        MAX(send_date) AS last_sent_date
+    FROM `{EMAIL_LOG_TABLE}`
+    WHERE campaign = '{CAMPAIGN_NAME}' AND status = 'sent'
+    GROUP BY client_id
+    """
+    rows = get_bq_client().query(query).result()
+    return {
+        r["client_id"]: {
+            "count_this_month": int(r["count_this_month"] or 0),
+            "last_sent_date": r["last_sent_date"].isoformat() if r["last_sent_date"] else None,
+        }
+        for r in rows
+    }
+
+
+# -----------------------------
+# DO-NOT-CONTACT SUPPRESSION
+# -----------------------------
+def normalize_phone(phone):
+    """Canonicalize a phone number for cross-table matching -- both
+    recovery_dashboard_daily and manual_do_not_contact mix 11-digit Nigerian
+    local numbers (leading 0), 10-digit Kenyan local numbers, and some with
+    a 234/254 country code instead of the leading 0."""
+    s = re.sub(r"\D", "", str(phone or ""))
+    if s.startswith("234") and len(s) > 10:
+        s = "0" + s[3:]
+    elif s.startswith("254") and len(s) > 9:
+        s = "0" + s[3:]
+    if s and not s.startswith("0") and len(s) in (9, 10):
+        s = "0" + s
+    return s
+
+
+def get_do_not_contact_phones():
+    """Normalized phone numbers to suppress from every campaign, regardless
+    of which institution the manual_do_not_contact row names. Active is
+    treated as blocking unless explicitly False."""
+    query = """
+    SELECT phone
+    FROM `fssspark.original_cohorts.manual_do_not_contact`
+    WHERE COALESCE(Active, TRUE) != FALSE
+    """
+    rows = get_bq_client().query(query).result()
+    return {normalize_phone(r["phone"]) for r in rows if r["phone"]}
 
 
 def days_since(date_str):
@@ -372,16 +411,24 @@ def send_email(recipient, subject, message, logger, campaign_name="FSS Email Cam
 # -----------------------------
 # CONFIG (script-specific)
 # -----------------------------
-DRY_RUN = True  # True = build/report every email without calling the send API
-                # or writing to the dedupe log. Set False only after a
-                # reviewed dry run.
+DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
+# True = build/report every email without calling the send API or writing
+# to the dedupe log. Defaults to True (safe) unless DRY_RUN=false is set
+# via env var -- flip it in Render's dashboard once a dry run has been
+# reviewed; no code change or redeploy needed.
 
-MAX_WORKERS = 10
+MAX_WORKERS = 20
 
-# Frequency guards -- enforced in code (BigQuery's success counters can lag
-# behind real sends, see fetch_recovery_rows docstring), so both BigQuery's
-# monthly/last-success data AND this script's own local send log are
-# checked, taking whichever signal is more conservative.
+# Fixed send days -- mirrors kudi_email_campaign.py's day-10/day-23 gate, so
+# this script can be invoked by a daily cron and still only actually act on
+# these four calendar days each month.
+FIXED_SEND_DAYS = {9, 16, 23, 28}
+
+# Per-customer frequency guards -- kept as a second safety net alongside
+# FIXED_SEND_DAYS (BigQuery's success counters can lag behind real sends,
+# see fetch_recovery_rows docstring), so both BigQuery's monthly/last-success
+# data AND this script's own local send log are checked, taking whichever
+# signal is more conservative.
 RECENCY_DAYS = 7          # skip if a successful send happened in the last 7 days
 MONTHLY_CAP = 4           # skip if already 4 successful sends this calendar month
 ELIGIBILITY_BALANCE_FIELD_THRESHOLD = 1000  # same net_balance_concession > 1000 gate as the original script's KUDA branch
@@ -393,9 +440,11 @@ ELIGIBILITY_BALANCE_FIELD_THRESHOLD = 1000  # same net_balance_concession > 1000
 def get_kuda_customers():
     df = fetch_recovery_rows(
         institution="KUDA",
+        extra_select_sql="d.assigned_agent_number",
         extra_where_sql=f"d.net_balance_concession > {ELIGIBILITY_BALANCE_FIELD_THRESHOLD}",
     )
-    local_summary = summarize_local_sends(REAL_CAMPAIGN_LOG_FILE)
+    local_summary = summarize_bq_sends()
+    dnc_phones = get_do_not_contact_phones()
 
     customers = []
     skip_counts = Counter()
@@ -414,7 +463,8 @@ def get_kuda_customers():
             "net_balance": float(row["net_balance"]),
             "net_balance_concession": float(row["net_balance_concession"]),
             "payment_account": str(row["payment_account"]),
-            "days_overdue": int(row["max_days_in_arrears_running"]),
+            "days_overdue": safe_int(row["max_days_in_arrears_running"]),
+            "assigned_agent_number": safe_str(row.get("assigned_agent_number", "")),
         }
         c["full_name"] = f"{c['first_name']} {c['surname']}".title()
 
@@ -425,6 +475,8 @@ def get_kuda_customers():
 
         if not email or "@" not in email:
             reason = "no_valid_email"
+        elif normalize_phone(c["phone"]) in dnc_phones:
+            reason = "do_not_contact"
         elif failed_ever > 0:
             reason = "failed_ever"
         elif recency_days is not None and recency_days < RECENCY_DAYS:
@@ -447,19 +499,19 @@ def get_kuda_customers():
 # -----------------------------
 # EMAIL TEMPLATES
 # -----------------------------
+# Keyed directly off FIXED_SEND_DAYS rather than calendar-week ranges, so
+# each of the 4 templates fires exactly once, in order, on the 4 days this
+# script actually runs -- calendar ranges (1-7/8-14/15-21/22-31) would skip
+# Week 1 entirely and fire Week 4 twice (on both day 23 and day 28).
+WEEK_BY_SEND_DAY = {9: 1, 16: 2, 23: 3, 28: 4}
+
+
 def select_week(day):
-    if 1 <= day <= 7:
-        return 1
-    elif 8 <= day <= 14:
-        return 2
-    elif 15 <= day <= 21:
-        return 3
-    else:
-        return 4
+    return WEEK_BY_SEND_DAY.get(day, 4)
 
 
 def build_email(first_name, net_balance, net_balance_concession, payment_account,
-                full_name, phone, days_overdue, as_of=None):
+                full_name, phone, days_overdue, assigned_agent_number=None, as_of=None):
     as_of = as_of or datetime.now()
     week = select_week(as_of.day)
 
@@ -473,7 +525,10 @@ def build_email(first_name, net_balance, net_balance_concession, payment_account
     else:
         suggested_fmt = f"<b>NGN {round(net_balance * 0.25):,.0f}</b>"
 
-    whatsapp = get_whatsapp_number(phone)
+    # Prefer the per-customer assigned_agent_number from BigQuery; only fall
+    # back to the generic phone-modulo-6 bucket when it's missing for this
+    # customer.
+    whatsapp = assigned_agent_number or get_whatsapp_number(phone)
     chatbot = get_chatbot_link(phone)
     account_name_line = get_account_name("KUDA", payment_account, full_name) or full_name
     payment_account_b = f"<b>{payment_account}</b>"
@@ -488,7 +543,7 @@ Account Name: {account_name_line}</p>"""
 
     if week == 1:
         template_label = "Kuda Week 1"
-        subject = "Your Kuda loan: start resolving it this month"
+        subject = "Urgent - Your Kuda loan: start resolving it this month"
         discount_sentence = (
             f"<p>This month you can settle your loan in full for {settlement_fmt} instead of {outstanding_fmt}.</p>"
             if has_discount else ""
@@ -507,7 +562,7 @@ Account Name: {account_name_line}</p>"""
 
     elif week == 2:
         template_label = "Kuda Week 2"
-        subject = "Reminder: your Kuda loan is still outstanding"
+        subject = "Urgent - Reminder: your Kuda loan is still outstanding"
         discount_sentence = (
             f"<p>Your settlement offer of {settlement_fmt} is still available this month.</p>"
             if has_discount else ""
@@ -526,7 +581,7 @@ Account Name: {account_name_line}</p>"""
 
     elif week == 3:
         template_label = "Kuda Week 3"
-        subject = "Action needed on your Kuda loan"
+        subject = "Urgent - Action needed on your Kuda loan"
         if has_discount:
             status_sentence = f"<p>There are two weeks left to settle for {settlement_fmt}. After the month ends, the full balance of {outstanding_fmt} applies.</p>"
         else:
@@ -544,10 +599,11 @@ Account Name: {account_name_line}</p>"""
 
     else:
         template_label = "Kuda Week 4"
-        subject = "Final notice this month: your Kuda loan"
         if has_discount:
+            subject = "Urgent - Your Kuda loan discount expires at the end of the month"
             status_sentence = f"<p>Your settlement offer of {settlement_fmt} expires at the end of this month. After that, the full balance of {outstanding_fmt} will be reinstated and this offer withdrawn.</p>"
         else:
+            subject = "Urgent - Final notice this month: your Kuda loan"
             status_sentence = f"<p>Please pay at least {suggested_fmt} before the end of the month.</p>"
         body = f"""
 {FSS_LOGO_HTML}
@@ -573,6 +629,11 @@ def run():
     logger.log(f"DRY_RUN = {DRY_RUN}")
     logger.log("=" * 70)
 
+    day = datetime.now().day
+    if day not in FIXED_SEND_DAYS:
+        logger.log(f"Today is day {day} — Kuda campaign only sends on days {sorted(FIXED_SEND_DAYS)}. Exiting.")
+        return [], Counter(), []
+
     customers, skip_counts = get_kuda_customers()
     logger.log(f"Found {len(customers)} KUDA customers (net_balance_concession > {ELIGIBILITY_BALANCE_FIELD_THRESHOLD}) before guards.")
 
@@ -585,6 +646,7 @@ def run():
             full_name=c["full_name"],
             phone=c["phone"],
             days_overdue=c["days_overdue"],
+            assigned_agent_number=c.get("assigned_agent_number"),
         )
         c["subject"] = subject
         c["_message"] = message
@@ -626,11 +688,11 @@ def run():
                 c["send_to_email"], c["subject"], c["_message"], logger, campaign_name="FSS Kuda Campaign"
             )
             status = "sent" if actually_sent else "failed"
-            record_send(REAL_CAMPAIGN_LOG_FILE, c, c["template_label"], status, response.status_code)
+            record_send(c, c["template_label"], status, response.status_code)
             return actually_sent
         except Exception as e:
             logger.log(f"  ERROR sending to {c['send_to_email']}: {e}")
-            record_send(REAL_CAMPAIGN_LOG_FILE, c, c["template_label"], "error", None)
+            record_send(c, c["template_label"], "error", None)
             return False
 
     sent = 0
