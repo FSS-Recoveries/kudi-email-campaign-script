@@ -526,15 +526,15 @@ def get_numida_customers():
         local = local_summary.get(client_id, {"count_this_month": 0, "last_sent_date": None})
         month_count = effective_month_count(int(row["bq_success_this_month"]), local["count_this_month"])
         recency_days = effective_recency_days(row["bq_last_success_date"], local["last_sent_date"])
-        failed_ever = int(row["failed_ever"])
         passes_balance_filter = effective_balance > BALANCE_FILTER_THRESHOLD
 
+        # Unlike Kuda/Kudi, Numida retries everyone regardless of past
+        # failed_ever -- a prior bounce/failure no longer permanently
+        # excludes a customer here.
         if not email or "@" not in email:
             reason = "no_valid_email"
         elif normalize_phone(c["phone"]) in dnc_phones:
             reason = "do_not_contact"
-        elif failed_ever > 0:
-            reason = "failed_ever"
         elif not passes_balance_filter:
             reason = "balance_below_threshold"
         elif recency_days is not None and recency_days < RECENCY_DAYS:
