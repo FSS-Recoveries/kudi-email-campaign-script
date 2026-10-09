@@ -417,12 +417,12 @@ DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
 # via env var -- flip it in Render's dashboard once a dry run has been
 # reviewed; no code change or redeploy needed.
 
-MAX_WORKERS = 20
+MAX_WORKERS = 10
 
 # Fixed send days -- mirrors kudi_email_campaign.py's day-10/day-23 gate, so
 # this script can be invoked by a daily cron and still only actually act on
 # these four calendar days each month.
-FIXED_SEND_DAYS = {9, 16, 23, 28}
+FIXED_SEND_DAYS = {9, 13, 20, 27}
 
 # Per-customer frequency guards -- kept as a second safety net alongside
 # FIXED_SEND_DAYS (BigQuery's success counters can lag behind real sends,
@@ -503,7 +503,7 @@ def get_kuda_customers():
 # each of the 4 templates fires exactly once, in order, on the 4 days this
 # script actually runs -- calendar ranges (1-7/8-14/15-21/22-31) would skip
 # Week 1 entirely and fire Week 4 twice (on both day 23 and day 28).
-WEEK_BY_SEND_DAY = {9: 1, 16: 2, 23: 3, 28: 4}
+WEEK_BY_SEND_DAY = {9: 1, 13: 2, 20: 3, 27: 4}
 
 
 def select_week(day):
@@ -537,7 +537,7 @@ def build_email(first_name, net_balance, net_balance_concession, payment_account
 {payment_account_b}<br>
 Account Name: {account_name_line}</p>"""
 
-    proof_line = f'<p>Once you\'ve paid, please send proof via WhatsApp <b>{whatsapp}</b> or reply to this email. If you\'ve already made a payment recently, thank you. Please send us the proof so we can update your account. You can also reach our team here: {chatbot}</p>'
+    proof_line = f'<p>Once you\'ve paid, please send proof via WhatsApp <b>{whatsapp}</b> or reply to this email so we can update your account accordingly. You can also reach our team here: {chatbot}</p>'
     signoff = '<p>Kind regards,<br><b>FSS Recovery Team</b><br>On behalf of <b>Kuda</b></p>'
     footer_style = '<style>.unsubscribe, .unsub, [class*="unsub"], [class*="footer"] a { font-size: 2px !important; color: #cccccc !important; }</style>'
 
@@ -545,15 +545,20 @@ Account Name: {account_name_line}</p>"""
         template_label = "Kuda Week 1"
         subject = "Urgent - Your Kuda loan: start resolving it this month"
         discount_sentence = (
-            f"<p>This month you can settle your loan in full for {settlement_fmt} instead of {outstanding_fmt}.</p>"
+            f"<p>We are pleased to offer you a discount offer on your loan. This month you can settle your loan in full for {settlement_fmt} instead of the current outstanding of {outstanding_fmt}.</p>"
             if has_discount else ""
+        )
+        partial_payment_sentence = (
+            f"<p>If you can't pay it all at once, you can start with an initial payment of {suggested_fmt}. Every payment reduces what you owe. We urge you to take advantage of this offer as it's time sensitive and expires at the end of the current month, after which the full amount will be reinstated and more stringent recovery actions taken.</p>"
+            if has_discount else
+            f"<p>If you can't pay it all at once, you can start with {suggested_fmt}. Every payment reduces what you owe. If you'd like to agree a payment plan that works for you, just reply to this email.</p>"
         )
         body = f"""
 {FSS_LOGO_HTML}
 <p>Hi {first_name},</p>
-<p>FSS is working with Kuda on overdue loan accounts, and we're reaching out about yours. Your account is <b>{days_overdue} days past due</b>, with an outstanding balance of {outstanding_fmt}.</p>
+<p>FSS is reaching out on behalf of Kuda regarding your outstanding loan balance. Your account is currently <b>{days_overdue} days past due</b>, with an outstanding balance of {outstanding_fmt}.</p>
 {discount_sentence}
-<p>If you can't pay it all at once, you can start with {suggested_fmt}. Every payment reduces what you owe. If you'd like to agree a payment plan that works for you, just reply to this email.</p>
+{partial_payment_sentence}
 {payment_block}
 {proof_line}
 {signoff}
@@ -600,19 +605,21 @@ Account Name: {account_name_line}</p>"""
     else:
         template_label = "Kuda Week 4"
         if has_discount:
-            subject = "Urgent - Your Kuda loan discount expires at the end of the month"
-            status_sentence = f"<p>Your settlement offer of {settlement_fmt} expires at the end of this month. After that, the full balance of {outstanding_fmt} will be reinstated and this offer withdrawn.</p>"
+            subject = "Urgent - Your Kuda loan discount expires at the end of this month"
+            status_sentence = f"<p>Your special settlement offer of {settlement_fmt} expires at the end of this month. Once it expires, the full outstanding balance of {outstanding_fmt} will be reinstated and this opportunity will be withdrawn.</p>"
+            escalation_sentence = "<p>You must act now. You can resolve your Kuda loan account at a significantly reduced amount before this offer expires. If we do not hear from you we will proceed with escalating the recovery process and exploring all recovery options without further notice.</p>"
         else:
             subject = "Urgent - Final notice this month: your Kuda loan"
-            status_sentence = f"<p>Please pay at least {suggested_fmt} before the end of the month.</p>"
+            status_sentence = f"<p>Please pay at least {suggested_fmt} before the end of this month.</p>"
+            escalation_sentence = "<p>If we do not receive a payment, we will escalate the recovery process.</p>"
         body = f"""
 {FSS_LOGO_HTML}
 <p>Hi {first_name},</p>
-<p>This is an urgent notice from FSS on behalf of Kuda. Your account is <b>{days_overdue} days past due</b>.</p>
+<p>This is an urgent notice from FSS on behalf of Kuda. Your account is currently <b>{days_overdue} days past due</b>.</p>
 {status_sentence}
-<p>If we do not receive a payment, we will escalate the recovery process.</p>
+{escalation_sentence}
 {payment_block}
-<p>Once you've paid, please send proof via WhatsApp <b>{whatsapp}</b> or reply to this email before the end of the month. If you've already made a payment recently, thank you. Please send us the proof so we can update your account. You can also reach our team here: {chatbot}</p>
+<p>Once you have made a payment please send proof via WhatsApp <b>{whatsapp}</b> or reply directly to this email before the end of this month. You can also reach our team here: {chatbot}</p>
 {signoff}
 {footer_style}
 """
