@@ -65,7 +65,7 @@ DISCOUNT_THRESHOLD = 1000
 # customer whose only recorded failures fall on an ignored date is treated
 # as never having failed. Add more dates here as similar incidents are
 # confirmed.
-FAILED_DATES_TO_IGNORE = ["2026-09-29"]
+FAILED_DATES_TO_IGNORE = ["2026-09-29", "2026-10-09"]
 
 
 def get_credentials():
