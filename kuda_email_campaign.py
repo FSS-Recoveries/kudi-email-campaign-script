@@ -434,14 +434,19 @@ MAX_WORKERS = 10
 # Fixed send days -- mirrors kudi_email_campaign.py's day-10/day-23 gate, so
 # this script can be invoked by a daily cron and still only actually act on
 # these four calendar days each month.
-FIXED_SEND_DAYS = {7, 14, 21, 28}
+FIXED_SEND_DAYS = {7, 15, 21, 28}
 
 # Per-customer frequency guards -- kept as a second safety net alongside
 # FIXED_SEND_DAYS (BigQuery's success counters can lag behind real sends,
 # see fetch_recovery_rows docstring), so both BigQuery's monthly/last-success
 # data AND this script's own local send log are checked, taking whichever
-# signal is more conservative.
-RECENCY_DAYS = 7          # skip if a successful send happened in the last 7 days
+# signal is more conservative. RECENCY_DAYS is intentionally much smaller
+# than the ~7-day gap between FIXED_SEND_DAYS -- that gap is the real
+# cadence control now; this just stops a customer being re-emailed if the
+# same fixed day is ever triggered more than once (an off-cycle manual
+# run previously caused RECENCY_DAYS=7 to block nearly everyone on the
+# next real scheduled day).
+RECENCY_DAYS = 1          # skip if a successful send happened in the last 1 day
 MONTHLY_CAP = 4           # skip if already 4 successful sends this calendar month
 ELIGIBILITY_BALANCE_FIELD_THRESHOLD = 1000  # same net_balance_concession > 1000 gate as the original script's KUDA branch
 
@@ -515,7 +520,7 @@ def get_kuda_customers():
 # each of the 4 templates fires exactly once, in order, on the 4 days this
 # script actually runs -- calendar ranges (1-7/8-14/15-21/22-31) would skip
 # Week 1 entirely and fire Week 4 twice (on both day 23 and day 28).
-WEEK_BY_SEND_DAY = {7: 1, 14: 2, 21: 3, 28: 4}
+WEEK_BY_SEND_DAY = {7: 1, 15: 2, 21: 3, 28: 4}
 
 
 def select_week(day):
