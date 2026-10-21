@@ -429,7 +429,7 @@ DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
 # via env var -- flip it in Render's dashboard once a dry run has been
 # reviewed; no code change or redeploy needed.
 
-MAX_WORKERS = 10
+MAX_WORKERS = 22
 
 # Fixed send days -- mirrors kudi_email_campaign.py's day-10/day-23 gate, so
 # this script can be invoked by a daily cron and still only actually act on
