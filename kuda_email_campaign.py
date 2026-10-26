@@ -556,11 +556,15 @@ Account Name: {account_name_line}</p>"""
 
     proof_line = f'<p>Once you\'ve paid, please send proof via WhatsApp <b>{whatsapp}</b> or reply to this email so we can update your account accordingly. You can also reach our team here: {chatbot}</p>'
     signoff = '<p>Kind regards,<br><b>FSS Recovery Team</b><br>On behalf of <b>Kuda</b></p>'
-    footer_style = '<style>.unsubscribe, .unsub, [class*="unsub"], [class*="footer"] a { font-size: 2px !important; color: #cccccc !important; }</style>'
+    # No longer shrinking/hiding the unsubscribe or footer links -- Kudi's
+    # Gmail rate-limiting analysis flagged "unusual rate of unsolicited
+    # mail" as a leading cause; deliberately hiding the unsubscribe link is
+    # exactly the pattern bulk-sender compliance checks look for.
+    footer_style = ''
 
     if week == 1:
         template_label = "Kuda Week 1"
-        subject = "Urgent - Your Kuda loan: start resolving it this month"
+        subject = "A settlement offer on your Kuda loan"
         discount_sentence = (
             f"<p>We are pleased to offer you a discount offer on your loan. This month you can settle your loan in full for {settlement_fmt} instead of the current outstanding of {outstanding_fmt}.</p>"
             if has_discount else ""
@@ -584,7 +588,7 @@ Account Name: {account_name_line}</p>"""
 
     elif week == 2:
         template_label = "Kuda Week 2"
-        subject = "Urgent - Reminder: your Kuda loan is still outstanding"
+        subject = "Reminder: your Kuda loan settlement offer is still open"
         discount_sentence = (
             f"<p>Your settlement offer of {settlement_fmt} is still available this month.</p>"
             if has_discount else ""
@@ -603,7 +607,7 @@ Account Name: {account_name_line}</p>"""
 
     elif week == 3:
         template_label = "Kuda Week 3"
-        subject = "Urgent - Action needed on your Kuda loan"
+        subject = "Two weeks left on your Kuda loan offer"
         if has_discount:
             status_sentence = f"<p>There are two weeks left to settle for {settlement_fmt}. After the month ends, the full balance of {outstanding_fmt} applies.</p>"
         else:
@@ -622,11 +626,11 @@ Account Name: {account_name_line}</p>"""
     else:
         template_label = "Kuda Week 4"
         if has_discount:
-            subject = "Urgent - Your Kuda loan discount expires at the end of this month"
+            subject = "Your Kuda loan discount expires at month-end"
             status_sentence = f"<p>Your special settlement offer of {settlement_fmt} expires at the end of this month. Once it expires, the full outstanding balance of {outstanding_fmt} will be reinstated and this opportunity will be withdrawn.</p>"
             escalation_sentence = "<p>You must act now. You can resolve your Kuda loan account at a significantly reduced amount before this offer expires. If we do not hear from you we will proceed with escalating the recovery process and exploring all recovery options without further notice.</p>"
         else:
-            subject = "Urgent - Final notice this month: your Kuda loan"
+            subject = "Please resolve your Kuda loan before month-end"
             status_sentence = f"<p>Please pay at least {suggested_fmt} before the end of this month.</p>"
             escalation_sentence = "<p>If we do not receive a payment, we will escalate the recovery process.</p>"
         body = f"""

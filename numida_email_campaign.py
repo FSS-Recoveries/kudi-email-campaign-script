@@ -597,7 +597,11 @@ def build_email(first_name, net_balance, effective_balance, payment_account,
 {payment_account_b}<br>
 {account_name_line}</p>"""
     signoff = '<p>Kind regards,<br><b>FSS Recovery Team</b><br>On behalf of <b>Numida</b></p>'
-    footer_style = '<style>.unsubscribe, .unsub, [class*="unsub"], [class*="footer"] a { font-size: 2px !important; color: #cccccc !important; }</style>'
+    # No longer shrinking/hiding the unsubscribe or footer links -- Kudi's
+    # Gmail rate-limiting analysis flagged "unusual rate of unsolicited
+    # mail" as a leading cause; deliberately hiding the unsubscribe link is
+    # exactly the pattern bulk-sender compliance checks look for.
+    footer_style = ''
 
     if template_number == 1:
         template_label = "Numida Template 1"

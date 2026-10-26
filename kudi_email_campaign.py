@@ -668,7 +668,7 @@ def build_email(first_name, institution, net_balance, net_balance_concession,
 
     if not is_end_of_month and has_discount:
         template_label = "Email 1A"
-        subject = f"Urgent: Loan Settlement Offer Available — {institution}"
+        subject = f"A settlement offer on your {institution} loan"
         body = f"""
 {FSS_LOGO_HTML}
 <p>Hi {first_name},</p>
@@ -681,12 +681,11 @@ Account Name: {account_name_line}</p>
 <p>Once you have made a payment please send proof via WhatsApp <b>{whatsapp}</b> or reply directly to this email.</p>
 <p>You can also reach our team here: {chatbot}</p>
 <p>Kind regards,<br><b>FSS Recovery Team</b><br>On behalf of <b>{institution}</b></p>
-<style>.unsubscribe, .unsub, [class*="unsub"], [class*="footer"] a {{ font-size: 2px !important; color: #cccccc !important; }}</style>
 """
 
     elif not is_end_of_month and not has_discount:
         template_label = "Email 1B"
-        subject = f"Urgent: Loan Account Action Required — {institution}"
+        subject = f"Your {institution} loan needs attention"
         body = f"""
 {FSS_LOGO_HTML}
 <p>Hi {first_name},</p>
@@ -698,12 +697,11 @@ Account Name: {account_name_line}</p>
 <p>Once you have made a payment please send proof via WhatsApp <b>{whatsapp}</b> or reply directly to this email.</p>
 <p>You can also reach our team here: {chatbot}</p>
 <p>Kind regards,<br><b>FSS Recovery Team</b><br>On behalf of <b>{institution}</b></p>
-<style>.unsubscribe, .unsub, [class*="unsub"], [class*="footer"] a {{ font-size: 2px !important; color: #cccccc !important; }}</style>
 """
 
     elif is_end_of_month and has_discount:
         template_label = "Email 2A"
-        subject = f"Urgent: Your Loan Discount Offer Expires This Month — {institution}"
+        subject = f"Your {institution} loan discount expires this month"
         body = f"""
 {FSS_LOGO_HTML}
 <p>Hi {first_name},</p>
@@ -716,12 +714,11 @@ Account Name: {account_name_line}</p>
 <p>Once you have made a payment please send proof via WhatsApp <b>{whatsapp}</b> or reply directly to this email before the end of this month.</p>
 <p>You can also reach our team here: {chatbot}</p>
 <p>Kind regards,<br><b>FSS Recovery Team</b><br>On behalf of <b>{institution}</b></p>
-<style>.unsubscribe, .unsub, [class*="unsub"], [class*="footer"] a {{ font-size: 2px !important; color: #cccccc !important; }}</style>
 """
 
     else:
         template_label = "Email 2B"
-        subject = f"Urgent: Loan Account Requires Immediate Action — {institution}"
+        subject = f"Please resolve your {institution} loan this month"
         body = f"""
 {FSS_LOGO_HTML}
 <p>Hi {first_name},</p>
@@ -734,7 +731,6 @@ Account Name: {account_name_line}</p>
 <p>Once you have made a payment please send proof via WhatsApp <b>{whatsapp}</b> or reply directly to this email.</p>
 <p>You can also reach our team here: {chatbot}</p>
 <p>Kind regards,<br><b>FSS Recovery Team</b><br>On behalf of <b>{institution}</b></p>
-<style>.unsubscribe, .unsub, [class*="unsub"], [class*="footer"] a {{ font-size: 8px !important; color: #cccccc !important; }}</style>
 """
 
     return subject, body, template_label
