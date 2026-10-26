@@ -434,7 +434,7 @@ MAX_WORKERS = 8
 # Fixed send days -- mirrors kudi_email_campaign.py's day-10/day-23 gate, so
 # this script can be invoked by a daily cron and still only actually act on
 # these four calendar days each month.
-FIXED_SEND_DAYS = {7, 15, 22, 28}
+FIXED_SEND_DAYS = {7, 15, 22, 27}
 
 # Per-customer frequency guards -- kept as a second safety net alongside
 # FIXED_SEND_DAYS (BigQuery's success counters can lag behind real sends,
@@ -520,7 +520,7 @@ def get_kuda_customers():
 # each of the 4 templates fires exactly once, in order, on the 4 days this
 # script actually runs -- calendar ranges (1-7/8-14/15-21/22-31) would skip
 # Week 1 entirely and fire Week 4 twice (on both day 23 and day 28).
-WEEK_BY_SEND_DAY = {7: 1, 15: 2, 22: 3, 28: 4}
+WEEK_BY_SEND_DAY = {7: 1, 15: 2, 22: 3, 27: 4}
 
 
 def select_week(day):
