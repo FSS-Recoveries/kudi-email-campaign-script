@@ -494,10 +494,8 @@ def get_kuda_customers():
             reason = "no_valid_email"
         elif normalize_phone(c["phone"]) in dnc_phones:
             reason = "do_not_contact"
-        # TEMP 27 Oct - send to all, revert after
-        # (October failures were send errors on Kudi's side, not real bounces)
-        # elif failed_ever > 0:
-        #     reason = "failed_ever"
+        elif failed_ever > 0:
+            reason = "failed_ever"
         elif recency_days is not None and recency_days < RECENCY_DAYS:
             reason = "recent_send"
         elif month_count >= MONTHLY_CAP:
